@@ -21,12 +21,41 @@ class AgentResult:
     tokens_out: int
     cost_usd: float
     quality_score: float
+    trace_id: str | None = None
+
 
 
 class LabAgent:
     def __init__(self, model: str = "claude-sonnet-4-5") -> None:
         self.model = model
         self.llm = FakeLLM(model=model)
+
+    @observe(name="retrieval", as_type="retriever", capture_input=False, capture_output=False)
+    def _retrieve(self, message: str) -> list[str]:
+        return retrieve(message)
+
+    @observe(name="generation", as_type="generation", capture_input=False, capture_output=False)
+    def _generate(self, prompt_text: str, managed_prompt: Any | None = None):
+        response = self.llm.generate(prompt_text)
+        cost_usd = self._estimate_cost(response.usage.input_tokens, response.usage.output_tokens)
+        client = get_langfuse_client()
+        if hasattr(client, "update_current_generation"):
+            try:
+                client.update_current_generation(
+                    model=self.model,
+                    usage_details={
+                        "input": response.usage.input_tokens,
+                        "output": response.usage.output_tokens,
+                        "total": response.usage.input_tokens + response.usage.output_tokens,
+                    },
+                    cost_details={
+                        "total": cost_usd,
+                    },
+                    prompt=managed_prompt,
+                )
+            except Exception:
+                pass
+        return response, cost_usd
 
     @observe(name="lab-agent-run", as_type="agent", capture_input=False, capture_output=False)
     def run(
@@ -51,7 +80,7 @@ class LabAgent:
             },
         ):
             started = time.perf_counter()
-            docs = retrieve(message)
+            docs = self._retrieve(message)
             prompt = resolve_prompt(
                 langfuse_client,
                 feature=feature,
@@ -71,13 +100,11 @@ class LabAgent:
                 },
                 version=prompt.version,
             )
-            # TODO (CP2): instrument retrieve() and FakeLLM.generate() as child
-            # observations. The nested generation must receive prompt, usage and cost.
             with propagate_attributes(prompt=prompt.managed_prompt):
-                response = self.llm.generate(prompt.text)
+                response, cost_usd = self._generate(prompt.text, managed_prompt=prompt.managed_prompt)
             quality_score = self._heuristic_quality(message, response.text, docs)
             latency_ms = int((time.perf_counter() - started) * 1000)
-            cost_usd = self._estimate_cost(response.usage.input_tokens, response.usage.output_tokens)
+
 
         metrics.record_request(
             latency_ms=latency_ms,
@@ -88,6 +115,13 @@ class LabAgent:
             quality_score=quality_score,
         )
 
+        trace_id = None
+        if hasattr(langfuse_client, "get_current_trace_id"):
+            try:
+                trace_id = langfuse_client.get_current_trace_id()
+            except Exception:
+                pass
+
         return AgentResult(
             answer=response.text,
             latency_ms=latency_ms,
@@ -96,6 +130,7 @@ class LabAgent:
             tokens_out=response.usage.output_tokens,
             cost_usd=cost_usd,
             quality_score=quality_score,
+            trace_id=trace_id,
         )
 
     def _estimate_cost(self, tokens_in: int, tokens_out: int) -> float:
